@@ -1,12 +1,14 @@
 use h2::server;
 use http::{Response, StatusCode};
 use rand::Rng;
+use std::collections::VecDeque;
 use std::process;
 use std::sync::{
     atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -54,6 +56,7 @@ impl Aggregator {
 struct ThreadData {
     max_threads: usize,
     active_threads: AtomicU8,
+    queue: VecDeque<TcpStream>,
 }
 
 impl ThreadData {
@@ -61,6 +64,8 @@ impl ThreadData {
         Self {
             max_threads,
             active_threads: AtomicU8::new(0),
+            // Probably there is a better way, but in this case we restrict queue to be 20 items
+            queue: VecDeque::with_capacity(20),
         }
     }
 
@@ -73,10 +78,9 @@ impl ThreadData {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize listener and total storage
     let listener = Arc::new(TcpListener::bind("127.0.0.1:8080").await?);
-    let pool = Arc::new(ThreadData::new(MAX_CONNECTIONS));
+    let pool = Arc::new(RwLock::new(ThreadData::new(MAX_CONNECTIONS)));
     let global_aggregator: Arc<Aggregator> = Arc::new(Aggregator::new());
     let mut set = JoinSet::new();
-    let mut queue = Vec::new();
     let ga = global_aggregator.clone();
     ctrlc::set_handler(move || {
         ga.print_res("Closed server");
@@ -87,9 +91,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pool = pool.clone();
         let global_aggregator = global_aggregator.clone();
         match listener.accept().await {
-            Ok((socket, _)) => {
-                if !pool.is_full() {
-                    pool.active_threads.fetch_add(1, Ordering::SeqCst);
+            Ok((upcoming_stream, _)) => {
+                // accepting all requests
+                // could be optimised by skipping push/pop ops on empty queue
+                pool.write().await.queue.push_back(upcoming_stream);
+                // handling them in FILO order
+                if !pool.read().await.is_full() {
+                    // queue is never epmty on this stage
+                    let socket = pool.write().await.queue.pop_front().unwrap();
+                    pool.write()
+                        .await
+                        .active_threads
+                        .fetch_add(1, Ordering::SeqCst);
                     set.spawn(async move {
                         let start = Instant::now();
                         let mut h2 = server::handshake(socket).await.unwrap();
@@ -119,12 +132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         aggregator.print_res("Closed client connection");
-                        pool.active_threads.fetch_sub(1, Ordering::SeqCst);
+                        pool.write()
+                            .await
+                            .active_threads
+                            .fetch_sub(1, Ordering::SeqCst);
                         let end = start.elapsed();
                         global_aggregator.add_connection(end.as_millis().try_into().unwrap())
                     });
-                } else {
-                    queue.push(socket);
                 }
             }
             Err(err) => println!("Cannot hanlde client with err: {}", err),
