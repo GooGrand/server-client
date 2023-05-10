@@ -1,9 +1,9 @@
-use h2::client::{self, Builder, SendRequest, Connection};
+use h2::client;
 use http::{Method, Request};
 use std::error::Error;
-use std::str::Bytes;
+use std::net::TcpStream;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{sync::Arc, time::Duration};
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
@@ -18,22 +18,17 @@ pub async fn main() -> Result<(), Box<dyn Error>> {
         req_amount > 0 && req_amount <= 100,
         "Amount of requests should be between 1 and 100"
     );
-
-    let tcp = TcpStream::connect("127.0.0.1:8080").await?;
-    let h2: (SendRequest<&[u8]>, Connection<TcpStream, &[u8]>) = Builder::new()
-        .reset_stream_duration(Duration::from_secs(2))
-        .max_concurrent_streams(100)
-        .handshake(tcp).await?;
-    let (h2, connection) = h2;
-    // let (h2, connection) = client::handshake(tcp).await?;
-
+    let socket = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+    let tcp = TcpStream::connect_timeout(&socket, Duration::from_secs(2))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(2)))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let tokio_stream = tokio::net::TcpStream::from_std(tcp)?;
+    let (h2, connection) = client::handshake(tokio_stream).await?;
     tokio::spawn(async move {
         connection.await.unwrap();
     });
-
     let h2 = Arc::new(RwLock::new(h2.ready().await?));
     let mut set = JoinSet::new();
-    // let aggregator =
 
     for i in 0..req_amount {
         let h2 = h2.clone();
